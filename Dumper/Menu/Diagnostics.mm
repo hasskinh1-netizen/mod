@@ -294,7 +294,9 @@ namespace
         RawStr("pid      : ");
         RawDec(g_Pid);
         RawStr("\nthread   : ");
-        RawHex(reinterpret_cast<uintptr_t>(pthread_mach_thread_np(pthread_self())));
+        /* pthread_mach_thread_np() returns mach_port_t, an unsigned 32-bit
+         * integer - reinterpret_cast between integer types is ill-formed. */
+        RawHex(static_cast<uintptr_t>(pthread_mach_thread_np(pthread_self())));
         RawStr("\nstage    : ");
         RawStr(g_Stage);
         RawStr("\nfatal    : ");
