@@ -3,6 +3,8 @@
 #include <fstream>
 #include <format>
 #include <filesystem>
+#include <algorithm>
+#include <vector>
 #include <unistd.h>
 
 #include "Unreal/ObjectArray.h"
@@ -152,6 +154,109 @@ bool IsAddressValidGObjects(const uintptr Address, const FChunkedFixedUObjectArr
 	
 	LogInfo("FChunkedFixedUObjectArray validation successful");
 	return true;
+}
+
+namespace
+{
+	/* The scan used to dereference every 4-byte offset directly, which faults as
+	 * soon as an offset lands on a hole in the segment - the whole game dies
+	 * before the dumper can report "GObjects not found". Reading every field
+	 * through SafeRead makes that safe but costs one Mach trap per field per
+	 * offset (~23 per step), which turns a full-image pass into an hours-long
+	 * hang. So the numeric fields are read from 1 MiB windows copied in bulk
+	 * (one trap per window) and only the offsets that survive the cheap numeric
+	 * filter pay for the pointer validation. */
+	constexpr size_t ScanWindowSize  = 0x100000; /* 1 MiB */
+	constexpr size_t ScanWindowSlack = 0x40;     /* furthest field is +0x38 */
+
+	/* Copies up to Size bytes into Out and returns how many bytes the kernel
+	 * actually copied (it stops at the first unmapped page). */
+	vm_size_t ReadMemoryBulk(uintptr_t Address, size_t Size, void* Out)
+	{
+		vm_size_t Read = 0;
+		const kern_return_t Kr = vm_read_overwrite(mach_task_self(),
+		                                          (vm_address_t)Address,
+		                                          (vm_size_t)Size,
+		                                          (vm_address_t)Out,
+		                                          &Read);
+
+		if (Kr != KERN_SUCCESS && Read == 0)
+			return 0;
+
+		return Read;
+	}
+
+	/* Cheap numeric pre-filter evaluated on bytes we already own. Mirrors the
+	 * scalar half of IsAddressValidGObjects() so that the expensive half only
+	 * runs on plausible candidates. */
+	bool IsPlausibleFixedGObjects(const uint8* Base, size_t Available, const FFixedUObjectArrayLayout& Layout)
+	{
+		if (Layout.MaxObjectsOffset < 0 || Layout.NumObjectsOffset < 0)
+			return false;
+
+		if (static_cast<size_t>(Layout.MaxObjectsOffset) + sizeof(int32) > Available ||
+		    static_cast<size_t>(Layout.NumObjectsOffset) + sizeof(int32) > Available)
+			return false;
+
+		const int32 MaxElements = *reinterpret_cast<const int32*>(Base + Layout.MaxObjectsOffset);
+		const int32 NumElements = *reinterpret_cast<const int32*>(Base + Layout.NumObjectsOffset);
+
+		return NumElements >= 0x1000 && NumElements <= MaxElements && MaxElements <= 0x400000;
+	}
+
+	bool IsPlausibleChunkedGObjects(const uint8* Base, size_t Available, const FChunkedFixedUObjectArrayLayout& Layout)
+	{
+		if (Layout.MaxElementsOffset < 0 || Layout.NumElementsOffset < 0 ||
+		    Layout.MaxChunksOffset < 0 || Layout.NumChunksOffset < 0)
+			return false;
+
+		if (static_cast<size_t>(Layout.MaxElementsOffset) + sizeof(int32) > Available ||
+		    static_cast<size_t>(Layout.NumElementsOffset) + sizeof(int32) > Available ||
+		    static_cast<size_t>(Layout.MaxChunksOffset) + sizeof(int32) > Available ||
+		    static_cast<size_t>(Layout.NumChunksOffset) + sizeof(int32) > Available)
+			return false;
+
+		const int32 MaxElements = *reinterpret_cast<const int32*>(Base + Layout.MaxElementsOffset);
+		const int32 NumElements = *reinterpret_cast<const int32*>(Base + Layout.NumElementsOffset);
+		const int32 MaxChunks   = *reinterpret_cast<const int32*>(Base + Layout.MaxChunksOffset);
+		const int32 NumChunks   = *reinterpret_cast<const int32*>(Base + Layout.NumChunksOffset);
+
+		if (NumChunks < 0x1 || NumChunks > 0x14)
+			return false;
+
+		if (MaxChunks < 0x6 || MaxChunks > 0x22F)
+			return false;
+
+		if (NumElements > MaxElements || NumChunks > MaxChunks)
+			return false;
+
+		const bool bNumChunksFitsNumElements = ((NumElements / 0x10000) + 1) == NumChunks || ((NumElements / 0x10400) + 1) == NumChunks;
+		if (!bNumChunksFitsNumElements)
+			return false;
+
+		const bool bMaxChunksFitsMaxElements = (MaxElements / 0x10000) == MaxChunks || (MaxElements / 0x10400) == MaxChunks;
+		return bMaxChunksFitsMaxElements;
+	}
+
+	bool IsPlausibleGObjects(const uint8* Base, size_t Available)
+	{
+		if (Available < ScanWindowSlack)
+			return false;
+
+		for (const FFixedUObjectArrayLayout& Layout : FFixedUObjectArrayLayouts)
+		{
+			if (IsPlausibleFixedGObjects(Base, Available, Layout))
+				return true;
+		}
+
+		for (const FChunkedFixedUObjectArrayLayout& Layout : FChunkedFixedUObjectArrayLayouts)
+		{
+			if (IsPlausibleChunkedGObjects(Base, Available, Layout))
+				return true;
+		}
+
+		return false;
+	}
 }
 
 void ObjectArray::InitializeFUObjectItem(uint8* FirstItemPtr)
@@ -320,94 +425,138 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
         return false;
     };
 
-    for (int i = 0; i < SearchRange; i += 0x4)
+    /* The scan walks 1 MiB windows copied in bulk. Byte offsets that survive
+     * the cheap numeric filter in IsPlausibleGObjects() are then validated for
+     * real, which is the only place that pays for a Mach trap per field. */
+    bool bStopScan = false;
+    const uintptr SearchEnd = SearchBase + SearchRange;
+    std::vector<uint8> ScanWindow(ScanWindowSize + ScanWindowSlack);
+
+    for (uintptr WindowBase = SearchBase; WindowBase < SearchEnd && !bStopScan; )
     {
-        const uintptr CurrentAddress = SearchBase + i;
+        const uintptr Remaining = SearchEnd - WindowBase;
+        const size_t Want = static_cast<size_t>(std::min<uintptr>(static_cast<uintptr>(ScanWindowSize + ScanWindowSlack), Remaining));
+        const size_t Got = static_cast<size_t>(ReadMemoryBulk(WindowBase, Want, ScanWindow.data()));
 
-        /* Progress marker: tells us after the fact whether the scan was running
-         * (and how far it got) or whether it died on a candidate. */
-        if ((i & 0x3FFFFFF) == 0)
-            DiagSetStage("ObjectArray::Init: scanning for GObjects, 0x%lX / 0x%lX", (unsigned long)i, (unsigned long)SearchRange);
-
-        if (MatchesAnyLayout(FFixedUObjectArrayLayouts, CurrentAddress))
+        if (Got < ScanWindowSlack)
         {
-            GObjects = reinterpret_cast<uint8*>(SearchBase + i);
-            NumElementsPerChunk = -1;
-
-            Off::InSDK::ObjArray::GObjects = (SearchBase + i) - ImageBase;
-
-            LogSuccess("Found FFixedUObjectArray GObjects at offset 0x%X", Off::InSDK::ObjArray::GObjects);
-
-            ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
-            {
-                if (Index < 0 || Index > Num())
-                    return nullptr;
-
-                uint8* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8**>(ObjectsArray));
-
-                return *reinterpret_cast<void**>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
-            };
-
-            uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
-
-            if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
-            {
-                LogError("ObjectArray::Init: FFixedUObjectArray candidate has an unreadable item array (0x%llX)",
-                         (unsigned long long)(uintptr_t)ChunksPtr);
-                DiagMarkFatal("GObjects item array is unreadable");
-                GObjects = nullptr;
-                return;
-            }
-
-            ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
-
-            return;
+            /* Unmapped page inside the range: step one page and keep going. */
+            WindowBase += 0x4000;
+            continue;
         }
-        else if (MatchesAnyLayout(FChunkedFixedUObjectArrayLayouts, CurrentAddress))
+
+        const size_t CandidateEnd = Got - ScanWindowSlack;
+
+        for (size_t Offset = 0; Offset < CandidateEnd && !bStopScan; Offset += 0x4)
         {
-            GObjects = reinterpret_cast<uint8*>(SearchBase + i);
-            NumElementsPerChunk = 0x10000;
-            SizeOfFUObjectItem = 0x18;
-            FUObjectItemInitialOffset = 0x0;
+            const uintptr CurrentAddress = WindowBase + Offset;
 
-            Off::InSDK::ObjArray::GObjects = (SearchBase + i) - ImageBase;
+            /* Progress marker: tells us after the fact whether the scan was running
+             * (and how far it got) or whether it died on a candidate. */
+            if (((CurrentAddress - SearchBase) & 0x3FFFFFF) == 0)
+                DiagSetStage("ObjectArray::Init: scanning for GObjects, 0x%lX / 0x%lX", (unsigned long)(CurrentAddress - SearchBase), (unsigned long)SearchRange);
 
-            LogSuccess("Found FChunkedFixedUObjectArray GObjects at offset 0x%X", Off::InSDK::ObjArray::GObjects);
+            /* Cheap filter on bytes we already have in memory: no Mach trap. */
+            if (!IsPlausibleGObjects(ScanWindow.data() + Offset, Got - Offset))
+                continue;
 
-            ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+            if (MatchesAnyLayout(FFixedUObjectArrayLayouts, CurrentAddress))
             {
-                if (Index < 0 || Index > Num())
-                    return nullptr;
+                GObjects = reinterpret_cast<uint8*>(CurrentAddress);
+                NumElementsPerChunk = -1;
 
-                const int32 ChunkIndex = Index / PerChunk;
-                const int32 InChunkIdx = Index % PerChunk;
+                Off::InSDK::ObjArray::GObjects = CurrentAddress - ImageBase;
 
-                uint8* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8**>(ObjectsArray));
+                LogSuccess("Found FFixedUObjectArray GObjects at offset 0x%X", Off::InSDK::ObjArray::GObjects);
 
-                uint8* Chunk = reinterpret_cast<uint8**>(ChunkPtr)[ChunkIndex];
-                uint8* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize);
+                ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+                {
+                    if (Index < 0 || Index > Num())
+                        return nullptr;
 
-                return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
-            };
-            
-            uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+                    uint8* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8**>(ObjectsArray));
 
-            if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
-            {
-                LogError("ObjectArray::Init: FChunkedFixedUObjectArray candidate has an unreadable chunk table (0x%llX)",
-                         (unsigned long long)(uintptr_t)ChunksPtr);
-                DiagMarkFatal("GObjects chunk table is unreadable");
-                GObjects = nullptr;
-                return;
+                    return *reinterpret_cast<void**>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
+                };
+
+                uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+
+                if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
+                {
+                    LogError("ObjectArray::Init: FFixedUObjectArray candidate has an unreadable item array (0x%llX)",
+                             (unsigned long long)(uintptr_t)ChunksPtr);
+                    DiagMarkFatal("GObjects item array is unreadable");
+                    GObjects = nullptr;
+                    bStopScan = true;
+                    break;
+                }
+
+                ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
+
+                bStopScan = true;
+                break;
             }
+            else if (MatchesAnyLayout(FChunkedFixedUObjectArrayLayouts, CurrentAddress))
+            {
+                GObjects = reinterpret_cast<uint8*>(CurrentAddress);
+                NumElementsPerChunk = 0x10000;
+                SizeOfFUObjectItem = 0x18;
+                FUObjectItemInitialOffset = 0x0;
 
-            ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
+                Off::InSDK::ObjArray::GObjects = CurrentAddress - ImageBase;
 
-            ObjectArray::InitializeChunkSize(GObjects + Off::FUObjectArray::GetObjectsOffset());
+                LogSuccess("Found FChunkedFixedUObjectArray GObjects at offset 0x%X", Off::InSDK::ObjArray::GObjects);
 
-            return;
+                ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+                {
+                    if (Index < 0 || Index > Num())
+                        return nullptr;
+
+                    const int32 ChunkIndex = Index / PerChunk;
+                    const int32 InChunkIdx = Index % PerChunk;
+
+                    uint8* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8**>(ObjectsArray));
+
+                    uint8* Chunk = reinterpret_cast<uint8**>(ChunkPtr)[ChunkIndex];
+                    uint8* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize);
+
+                    return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+                };
+
+                uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+
+                if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
+                {
+                    LogError("ObjectArray::Init: FChunkedFixedUObjectArray candidate has an unreadable chunk table (0x%llX)",
+                             (unsigned long long)(uintptr_t)ChunksPtr);
+                    DiagMarkFatal("GObjects chunk table is unreadable");
+                    GObjects = nullptr;
+                    bStopScan = true;
+                    break;
+                }
+
+                ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
+
+                ObjectArray::InitializeChunkSize(GObjects + Off::FUObjectArray::GetObjectsOffset());
+
+                bStopScan = true;
+                break;
+            }
         }
+
+        /* Advance one window. The slack read above overlaps into the next
+         * window, so no offset between two windows is skipped. If the kernel
+         * stopped early at an unmapped page, only advance over what it copied. */
+        if (Got < Want)
+            WindowBase += (Got & ~static_cast<size_t>(0x3));
+        else
+            WindowBase += ScanWindowSize;
     }
+
+    /* A candidate either matched (and the globals are set) or was rejected as
+     * unusable; in both cases there is nothing left to look for. */
+    if (bStopScan)
+        return;
 
     if (!bScanAllMemory)
     {
