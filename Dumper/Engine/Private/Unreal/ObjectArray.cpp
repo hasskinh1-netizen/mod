@@ -69,9 +69,9 @@ bool IsAddressValidGObjects(const uintptr Address, const FFixedUObjectArrayLayou
 		uint8 Pad[0x10];
 	};
 
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxObjectsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumObjectsOffset);
+	void* Objects = SafeRead<void*>(Address + Layout.ObjectsOffset, nullptr);
+	const int32 MaxElements = SafeRead<int32>(Address + Layout.MaxObjectsOffset, 0);
+	const int32 NumElements = SafeRead<int32>(Address + Layout.NumObjectsOffset, 0);
 
 
 	FUObjectItem* ObjectsButDecrypted = (FUObjectItem*)ObjectArray::DecryptPtr(Objects);
@@ -88,11 +88,14 @@ bool IsAddressValidGObjects(const uintptr Address, const FFixedUObjectArrayLayou
 	if (IsBadReadPtr(ObjectsButDecrypted))
         return false;
 
-	if (IsBadReadPtr(ObjectsButDecrypted[5].Object))
-        return false;
+	/* IsBadReadPtr only proves that the first byte is readable; the object and
+	 * its index live further in, so those are read with SafeRead as well. */
+	void* FifthObject = SafeRead<void*>(reinterpret_cast<uintptr_t>(ObjectsButDecrypted) + (5 * sizeof(FUObjectItem)), nullptr);
+	if (!FifthObject || IsBadReadPtr(FifthObject))
+		return false;
 
-	const uintptr FithObject = reinterpret_cast<uintptr>(ObjectsButDecrypted[0x5].Object);
-	const int32 IndexOfFithobject = *reinterpret_cast<int32*>(FithObject + 0xC);
+	const uintptr FithObject = reinterpret_cast<uintptr>(FifthObject);
+	const int32 IndexOfFithobject = SafeRead<int32>(FithObject + 0xC, -1);
 
 	if (IndexOfFithobject != 0x5)
 		return false;
@@ -103,11 +106,11 @@ bool IsAddressValidGObjects(const uintptr Address, const FFixedUObjectArrayLayou
 
 bool IsAddressValidGObjects(const uintptr Address, const FChunkedFixedUObjectArrayLayout& Layout)
 {
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxElementsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumElementsOffset);
-	const int32 MaxChunks   = *reinterpret_cast<const int32*>(Address + Layout.MaxChunksOffset);
-	const int32 NumChunks   = *reinterpret_cast<const int32*>(Address + Layout.NumChunksOffset);
+	void* Objects = SafeRead<void*>(Address + Layout.ObjectsOffset, nullptr);
+	const int32 MaxElements = SafeRead<int32>(Address + Layout.MaxElementsOffset, 0);
+	const int32 NumElements = SafeRead<int32>(Address + Layout.NumElementsOffset, 0);
+	const int32 MaxChunks   = SafeRead<int32>(Address + Layout.MaxChunksOffset, 0);
+	const int32 NumChunks   = SafeRead<int32>(Address + Layout.NumChunksOffset, 0);
 
 	void** ObjectsPtrButDecrypted = reinterpret_cast<void**>(ObjectArray::DecryptPtr(Objects));
 
@@ -138,10 +141,12 @@ bool IsAddressValidGObjects(const uintptr Address, const FChunkedFixedUObjectArr
 		return false;
 	
 
-	/* Check if every chunk-pointer is valid. */
+	/* Check if every chunk-pointer is valid. Read through SafeRead: a candidate
+	 * can point at a page that ends in the middle of this 20-entry array. */
 	for (int i = 0; i < NumChunks; i++)
 	{
-		if (!ObjectsPtrButDecrypted[i] || IsBadReadPtr(ObjectsPtrButDecrypted[i]))
+		void* Chunk = SafeRead<void*>(reinterpret_cast<uintptr_t>(ObjectsPtrButDecrypted) + (i * sizeof(void*)), nullptr);
+		if (!Chunk || IsBadReadPtr(Chunk))
 			return false;
 	}
 	

@@ -257,19 +257,33 @@ namespace
         void* Frames[64];
         const int FrameCount = backtrace(Frames, 64);
 
+        if (FrameCount <= 0)
+        {
+            RawStr("  <backtrace unavailable>\n");
+            return;
+        }
+
+        /* Raw program counters first, with no dyld calls in between: the process
+         * may have crashed while holding the dyld lock, in which case the name
+         * lookup below can block forever. With this pass the addresses are
+         * already on disk before anything risky runs. */
         for (int i = 0; i < FrameCount; i++)
         {
-            const uintptr_t Pc = reinterpret_cast<uintptr_t>(Frames[i]);
             RawStr("  #");
             RawDec(i);
             RawStr(" ");
-            RawHex(Pc);
-            RawImageOffset(Pc);
+            RawHex(reinterpret_cast<uintptr_t>(Frames[i]));
             RawStr("\n");
         }
 
-        if (FrameCount <= 0)
-            RawStr("  <backtrace unavailable>\n");
+        RawStr("  resolved:\n");
+        for (int i = 0; i < FrameCount; i++)
+        {
+            RawStr("  #");
+            RawDec(i);
+            RawImageOffset(reinterpret_cast<uintptr_t>(Frames[i]));
+            RawStr("\n");
+        }
     }
 
     void DiagSignalHandler(int Signal, siginfo_t* Info, void* /*Context*/)
@@ -301,13 +315,13 @@ namespace
         RawStr(g_Stage);
         RawStr("\nfatal    : ");
         RawStr(g_HasFatal ? g_Fatal : "no");
-        RawStr("\nbacktrace:\n");
-        RawBacktrace();
-        RawStr("dumper   : ");
+        RawStr("\ndumper   : ");
         RawHex(g_DumperBase);
         RawStr("\nmain     : ");
         RawHex(g_MainBase);
-        RawStr("\n========================\n");
+        RawStr("\nbacktrace:\n");
+        RawBacktrace();
+        RawStr("========================\n");
 
         /* Let the default action run so the OS still writes its own crash log. */
         signal(Signal, SIG_DFL);
@@ -347,11 +361,11 @@ namespace
             RawStr("exception: <none recorded>\n");
         }
 
-        RawStr("backtrace:\n");
-        RawBacktrace();
         RawStr("dumper   : ");
         RawHex(g_DumperBase);
-        RawStr("\n==========================\n");
+        RawStr("\nbacktrace:\n");
+        RawBacktrace();
+        RawStr("==========================\n");
         pthread_mutex_unlock(&g_Lock);
 
         signal(SIGABRT, SIG_DFL);
