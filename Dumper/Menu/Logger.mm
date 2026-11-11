@@ -7,6 +7,7 @@
 
 #include "Logger.h"
 #include "Console.h" // Your Console class
+#include "Diagnostics.h"
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -16,6 +17,10 @@ static void LogToConsole(int type, const char* fmt, va_list args) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     std::string msg(buffer);
+
+    // Mirror every line to disk: the console lives in RAM inside the game
+    // process and is lost if the process dies mid-generation.
+    DiagWriteLine(msg.c_str());
 
     // Assuming Console follows Singleton pattern or global instance
     // Type 0 = Info/Default, 1 = Error, 2 = Success/Special

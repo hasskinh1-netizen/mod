@@ -9,6 +9,7 @@
 #include "OffsetFinder/Offsets.h"
 #include "Utils.h"
 #include "Menu/Logger.h"
+#include "Menu/Diagnostics.h"
 
 
 namespace fs = std::filesystem;
@@ -151,7 +152,16 @@ bool IsAddressValidGObjects(const uintptr Address, const FChunkedFixedUObjectArr
 void ObjectArray::InitializeFUObjectItem(uint8* FirstItemPtr)
 {
     LogInfo("Initializing FUObjectItem...");
-    
+
+    /* A bad GObjects candidate can leave us with a null or unreadable item
+     * pointer; walking it below would fault immediately. */
+    if (!FirstItemPtr || IsBadReadPtr(FirstItemPtr))
+    {
+        LogError("InitializeFUObjectItem: invalid first item pointer (0x%llX) - keeping defaults",
+                 (unsigned long long)(uintptr_t)FirstItemPtr);
+        return;
+    }
+
     for (int i = 0x0; i < 0x10; i += 4)
     {
         if (!IsBadReadPtr(*reinterpret_cast<uint8**>(FirstItemPtr + i)))
@@ -191,10 +201,24 @@ void ObjectArray::InitDecryption(uint8* (*DecryptionFunction)(void* ObjPtr), con
 void ObjectArray::InitializeChunkSize(uint8* ChunksPtr)
 {
     LogInfo("Initializing chunk size...");
-    
+
+    if (!ChunksPtr || !ByIndex)
+    {
+        LogError("InitializeChunkSize: invalid chunk pointer (0x%llX) or missing ByIndex - keeping defaults",
+                 (unsigned long long)(uintptr_t)ChunksPtr);
+        return;
+    }
+
     int IndexOffset = 0x0;
     uint8* ObjAtIdx374 = (uint8*)ByIndex(ChunksPtr, 0x374, SizeOfFUObjectItem, FUObjectItemInitialOffset, 0x10000);
     uint8* ObjAtIdx106 = (uint8*)ByIndex(ChunksPtr, 0x106, SizeOfFUObjectItem, FUObjectItemInitialOffset, 0x10000);
+
+    if (!ObjAtIdx374 || !ObjAtIdx106 || IsBadReadPtr(ObjAtIdx374) || IsBadReadPtr(ObjAtIdx106))
+    {
+        LogError("InitializeChunkSize: could not resolve the probe objects (0x%llX / 0x%llX) - keeping default chunk size",
+                 (unsigned long long)(uintptr_t)ObjAtIdx374, (unsigned long long)(uintptr_t)ObjAtIdx106);
+        return;
+    }
 
     for (int i = 0x8; i < 0x20; i++)
     {
@@ -236,21 +260,32 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
     if (!bScanAllMemory)
     {
-        const auto [DataSection, DataSize] = GetSegmentByName(Header, "__TEXT");
+        /* UObjectArray/GObjects is a mutable global, so it lives in a data
+         * segment - never in __TEXT. The original code scanned __TEXT first,
+         * which can never match and forces the (very slow) full-image rescan on
+         * every run. Try __DATA first and keep the full scan as the fallback. */
+        const auto [DataSection, DataSize] = GetSegmentByName(Header, "__DATA");
 
-        if (DataSection != 0x0 && DataSize != 0x0)
+        if (DataSection != 0x0 && DataSize > 0x1000)
         {
             SearchBase = DataSection;
             SearchRange = DataSize;
         }
         else
         {
-            LogInfo("__text section not found, scanning all memory");
+            LogInfo("__DATA segment not found, scanning all memory");
             bScanAllMemory = true;
         }
     }
 
     /* Sub 0x50 so we don't try to read out of bounds memory when checking FixedArray->IsValid() or ChunkedArray->IsValid() */
+    if (SearchRange <= 0x50)
+    {
+        LogError("ObjectArray::Init: search range too small (0x%lX) - nothing to scan", (unsigned long)SearchRange);
+        DiagMarkFatal("GObjects search range is empty");
+        return;
+    }
+
     SearchRange -= 0x50;
 
     if (!bScanAllMemory)
@@ -284,6 +319,11 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
     {
         const uintptr CurrentAddress = SearchBase + i;
 
+        /* Progress marker: tells us after the fact whether the scan was running
+         * (and how far it got) or whether it died on a candidate. */
+        if ((i & 0x3FFFFFF) == 0)
+            DiagSetStage("ObjectArray::Init: scanning for GObjects, 0x%lX / 0x%lX", (unsigned long)i, (unsigned long)SearchRange);
+
         if (MatchesAnyLayout(FFixedUObjectArrayLayouts, CurrentAddress))
         {
             GObjects = reinterpret_cast<uint8*>(SearchBase + i);
@@ -304,6 +344,15 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
             };
 
             uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+
+            if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
+            {
+                LogError("ObjectArray::Init: FFixedUObjectArray candidate has an unreadable item array (0x%llX)",
+                         (unsigned long long)(uintptr_t)ChunksPtr);
+                DiagMarkFatal("GObjects item array is unreadable");
+                GObjects = nullptr;
+                return;
+            }
 
             ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
 
@@ -338,6 +387,15 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
             
             uint8* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
+            if (!ChunksPtr || IsBadReadPtr(ChunksPtr))
+            {
+                LogError("ObjectArray::Init: FChunkedFixedUObjectArray candidate has an unreadable chunk table (0x%llX)",
+                         (unsigned long long)(uintptr_t)ChunksPtr);
+                DiagMarkFatal("GObjects chunk table is unreadable");
+                GObjects = nullptr;
+                return;
+            }
+
             ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8**>(ChunksPtr));
 
             ObjectArray::InitializeChunkSize(GObjects + Off::FUObjectArray::GetObjectsOffset());
@@ -355,9 +413,10 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
     if (GObjects == nullptr)
     {
+        /* Killing the host game with exit(1) here looks exactly like a crash to
+         * the user. Report the failure and let the caller bail out cleanly. */
         LogError("GObjects couldn't be found!");
-        sleep(3);
-        exit(1);
+        DiagMarkFatal("GObjects couldn't be found (full memory scan exhausted)");
     }
 }
 
@@ -488,7 +547,13 @@ void ObjectArray::DumpObjectsWithProperties(const fs::path& Path, bool bWithPath
 
 int32 ObjectArray::Num()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
+	/* Num() is called from ByIndex() on every access, so only the null check
+	 * here - a bad GObjects candidate would fault on the first read. */
+	if (!GObjects)
+		return 0;
+
+	const int32 NumElements = *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
+	return NumElements > 0 ? NumElements : 0;
 }
 
 template<typename UEType>

@@ -167,11 +167,40 @@ void Off::InSDK::Text::InitTextOffsets()
 		}
 	}
 
+	/* Without both properties the offsets below are read from a null pointer. */
+	if (!InStringProp || !ReturnProp)
+	{
+		LogError("InitTextOffsets: Conv_StringToText is missing a parameter (InStringProp=%s, ReturnProp=%s) - skipped",
+		         InStringProp ? "found" : "null", ReturnProp ? "found" : "null");
+		return;
+	}
+
 	const int32 ParamSize = Conv_StringToText.GetStructSize();
 	const int32 FTextSize = ReturnProp.GetSize();
 
 	const int32 StringOffset = InStringProp.GetOffset();
 	const int32 ReturnValueOffset = ReturnProp.GetOffset();
+
+	/* Sanity-check everything before the alloca()/memset() below, which will
+	 * happily smash the stack if the struct size or one of the offsets is
+	 * garbage (wrong engine version, wrong property walk, ...). */
+	if (ParamSize <= 0 || ParamSize > 0x1000 || FTextSize <= 0 || FTextSize > 0x100)
+	{
+		LogError("InitTextOffsets: implausible sizes (ParamSize=0x%X, FTextSize=0x%X) - skipped", ParamSize, FTextSize);
+		return;
+	}
+
+	if (StringOffset < 0 || StringOffset + static_cast<int32>(sizeof(FString)) > ParamSize)
+	{
+		LogError("InitTextOffsets: InString offset 0x%X is outside the 0x%X byte param struct - skipped", StringOffset, ParamSize);
+		return;
+	}
+
+	if (ReturnValueOffset < 0 || ReturnValueOffset + FTextSize > ParamSize)
+	{
+		LogError("InitTextOffsets: return value offset 0x%X is outside the 0x%X byte param struct - skipped", ReturnValueOffset, ParamSize);
+		return;
+	}
 
 	Off::InSDK::Text::TextSize = FTextSize;
 

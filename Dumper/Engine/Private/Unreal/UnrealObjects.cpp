@@ -5,6 +5,7 @@
 #include "Unreal/UnrealObjects.h"
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
+#include "Utils.h"
 
 
 #include "Menu/Logger.h"
@@ -463,9 +464,47 @@ bool UEObject::operator!=(const UEObject& Other) const
 
 void UEObject::ProcessEvent(UEFunction Func, void* Params)
 {
-	void** VFT = *reinterpret_cast<void***>(GetAddress());
+	/* Calling ProcessEvent with a null object, a null function or the wrong
+	 * vtable index does not fail gracefully: it jumps to whatever sits in that
+	 * slot (index 0 is the deleting destructor) with a three-argument signature
+	 * and takes the whole game process down. Every input is validated first. */
+	if (!Object || IsBadReadPtr(Object))
+	{
+		LogError("ProcessEvent: invalid UObject (0x%llX) - call skipped\n", (unsigned long long)(uintptr_t)Object);
+		return;
+	}
 
-	void(*Prd)(void*, void*, void*) = decltype(Prd)(VFT[Off::InSDK::ProcessEvent::PEIndex]);
+	if (!Func.GetAddress() || IsBadReadPtr(Func.GetAddress()))
+	{
+		LogError("ProcessEvent: invalid UFunction (0x%llX) - call skipped\n", (unsigned long long)(uintptr_t)Func.GetAddress());
+		return;
+	}
+
+	void** VFT = *reinterpret_cast<void***>(Object);
+	if (!VFT || IsBadReadPtr(VFT))
+	{
+		LogError("ProcessEvent: unreadable vtable on object 0x%llX - call skipped\n", (unsigned long long)(uintptr_t)Object);
+		return;
+	}
+
+	const int32 PEIndex = Off::InSDK::ProcessEvent::PEIndex;
+	if (PEIndex <= 0 || PEIndex >= 0x400)
+	{
+		/* PEIndex == 0 means InitPE() never resolved the slot: VFT[0] is the
+		 * deleting destructor and calling it this way corrupts the heap. */
+		LogError("ProcessEvent: PEIndex (0x%X) was never resolved - call skipped\n", PEIndex);
+		return;
+	}
+
+	void* Slot = VFT[PEIndex];
+	if (!Slot || IsBadReadPtr(Slot))
+	{
+		LogError("ProcessEvent: vtable slot %d is not executable (0x%llX) - call skipped\n",
+		         PEIndex, (unsigned long long)(uintptr_t)Slot);
+		return;
+	}
+
+	void(*Prd)(void*, void*, void*) = decltype(Prd)(Slot);
 
 	Prd(Object, Func.GetAddress(), Params);
 }

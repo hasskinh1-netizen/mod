@@ -10,6 +10,7 @@
 #include "HashStringTable.h"
 #include "Utils.h"
 #include "Menu/Logger.h"
+#include "Menu/Diagnostics.h"
 #include "Unreal/NameArray.h"
 
 inline void InitSettings()
@@ -55,6 +56,17 @@ void Generator::InitEngineCore()
 {
 	LogInfo("Initializing Engine Core...");
 	ObjectArray::Init();
+
+	/* Without GObjects every later step dereferences garbage (or null). Bail out
+	 * instead of generating a half-empty SDK from an invalid object array. */
+	if (ObjectArray::DEBUGGetGObjects() == nullptr || ObjectArray::Num() <= 0)
+	{
+		LogError("InitEngineCore: GObjects is unavailable (0x%llX, Num=%d) - engine core not initialized",
+		         (unsigned long long)(uintptr_t)ObjectArray::DEBUGGetGObjects(), ObjectArray::Num());
+		DiagMarkFatal("GObjects unavailable - unsupported target or pattern mismatch");
+		return;
+	}
+
 	/* Per-game FName decryption hooks. Install BEFORE FName::Init.
 	 * Pick whichever match the target game; unused hooks default to identity.
 	 *
@@ -88,10 +100,28 @@ void Generator::InitEngineCore()
 	int32 GNamesOff = FindOffsetByIDAPatterns({
 		{"? ? ? ? 29 01 15 91 28 21 08 8B", 0}, // HOK: World
 	}, "GNames");
+
+	/* FName::Init(0, ...) silently builds a name array around the image base,
+	 * and every GetName() after that reads unrelated memory. */
+	if (GNamesOff <= 0)
+	{
+		LogError("InitEngineCore: GNames pattern did not match (offset = 0x%X)", GNamesOff);
+		DiagMarkFatal("GNames pattern not found - this game/version is not supported by the current pattern");
+		return;
+	}
+
 	FName::Init(GNamesOff, FName::EOffsetOverrideType::GNames, true, "NGR");
 	Off::Init();
 	PropertySizes::Init();
 	Off::InSDK::ProcessEvent::InitPE(); //Must be at this position, relies on offsets initialized in Off::Init()
+
+	if (!Off::InSDK::ProcessEvent::PEIndex)
+	{
+		/* Not fatal: SDK generation itself does not need ProcessEvent, but the
+		 * Kismet lookups do, and UEObject::ProcessEvent now refuses to jump. */
+		LogError("InitEngineCore: could not resolve the ProcessEvent vtable index - ProcessEvent calls are disabled");
+	}
+
 
 	Off::InSDK::World::InitGWorld(); //Must be at this position, relies on offsets initialized in Off::Init()
 
