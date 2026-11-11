@@ -99,27 +99,56 @@ jobs:
           grep -aE "$ERR_RE" "$LOG" | awk 'NR<=40' || true
           exit 0
 
+      # Toàn bộ block "Undefined symbols" được nhồi vào MỘT annotation duy nhất
+      # (xuống dòng mã hoá thành %0A) để không bị giới hạn 10 annotation / step.
       - name: "2. Lỗi linker / undefined symbol"
         if: failure()
         run: |
           LOG="$RUNNER_TEMP/xcodebuild.log"
           if [ ! -f "$LOG" ]; then exit 0; fi
 
-          LD_RE='(^| )ld: |Undefined symbols|undefined symbol|linker command failed|clang(\+\+)?: error|error: linker'
+          BLOCK="$(awk '
+            /^Undefined symbols for architecture/ { f = 1 }
+            f { print }
+            /^ld: symbol\(s\) not found/ { if (f) exit }
+          ' "$LOG" | head -c 6000)" || true
+
+          if [ -z "$BLOCK" ]; then
+            BLOCK="$(grep -aE '(^| )ld: |linker command failed|clang(\+\+)?: error|duplicate symbol' "$LOG" | head -c 6000)" || true
+          fi
 
           {
-            echo "### ❌ Lỗi linker (tối đa 40 dòng)"
+            echo "### ❌ Lỗi linker"
             echo '```'
-            grep -aE "$LD_RE" "$LOG" | awk 'NR<=40'
+            echo "$BLOCK"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
 
-          grep -aE "$LD_RE" "$LOG" 2>/dev/null | awk 'NR<=10' | while IFS=$'\r' read -r line; do
-            echo "::error::${line//%/%25}"
-          done
+          MSG="${BLOCK//%/%25}"
+          MSG="${MSG//$'\r'/}"
+          MSG="${MSG//$'\n'/%0A}"
+          echo "::error title=Undefined symbols::${MSG}"
 
           echo "----- in ra console để tìm nhanh -----"
-          grep -aE "$LD_RE" "$LOG" | awk 'NR<=40' || true
+          echo "$BLOCK"
+          exit 0
+
+      - name: "2b. Toàn bộ lỗi ld / clang"
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          if [ ! -f "$LOG" ]; then exit 0; fi
+
+          RE='(^| )ld: |linker command failed|clang(\+\+)?: error|duplicate symbol|Undefined symbols'
+          BLOCK="$(grep -aE "$RE" "$LOG" | awk 'length($0) < 400' | head -c 6000)" || true
+
+          MSG="${BLOCK//%/%25}"
+          MSG="${MSG//$'\r'/}"
+          MSG="${MSG//$'\n'/%0A}"
+          echo "::error title=Linker errors (tat ca)::${MSG}"
+
+          echo "----- in ra console -----"
+          echo "$BLOCK"
           exit 0
 
       - name: "3. Lệnh build thất bại + cuối log"
