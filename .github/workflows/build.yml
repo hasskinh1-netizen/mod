@@ -1,0 +1,98 @@
+name: Build iOS Dumper
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Hủy các run cũ cùng nhánh khi push liên tiếp
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE_PROJECT: Dumper.xcodeproj
+  XCODE_TARGET: Dumper
+  CONFIGURATION: Release
+  # SYMROOT cố định -> output luôn nằm ở build/Release-iphoneos/
+  SYMROOT: ${{ github.workspace }}/build
+
+jobs:
+  build:
+    # Project dùng objectVersion 70 + PBXFileSystemSynchronizedRootGroup
+    # => BẮT BUỘC Xcode >= 16. macos-latest luôn có Xcode mới nhất.
+    # Muốn build lặp lại y hệt thì đổi thành: runs-on: macos-15
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          echo "== Xcode có sẵn =="
+          ls /Applications | grep -i '^Xcode' || true
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Build Dumper.dylib (Release / arm64 / iphoneos)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -target "$XCODE_TARGET" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -arch arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            SYMROOT="$SYMROOT" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Verify binary
+        run: |
+          BIN="$SYMROOT/$CONFIGURATION-iphoneos/Dumper.dylib"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::Không tìm thấy $BIN"
+            find "$SYMROOT" -name '*.dylib' -print
+            exit 1
+          fi
+          lipo -info "$BIN"
+          otool -l "$BIN" | grep -A5 -m1 LC_BUILD_VERSION || true
+          nm -g "$BIN" 2>/dev/null | head -n 20 || true
+          ls -lh "$BIN"
+
+      - name: Upload Dumper.dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dumper-dylib-${{ github.sha }}
+          path: |
+            build/Release-iphoneos/Dumper.dylib
+            build/Release-iphoneos/Dumper.dylib.dSYM
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.sha }}
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7

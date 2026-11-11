@@ -1,0 +1,14 @@
+# Upstream reference (not part of this fork)
+Dumper-7/
+
+# Sibling project (separate git repo, tracked independently)
+iOS_UEDumper/
+
+# Xcode build artifacts
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+
+# macOS
+.DS_Store
